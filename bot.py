@@ -16,12 +16,8 @@ from pyrogram.errors import (
 try:
     from pyrogram.raw.functions.messages import CheckChatInvite
 except ImportError:
-    # بعض إصدارات Pyrogram لا تعرض هذه الدالة بنفس المسار؛
-    # لا ينبغي أن يمنع ذلك تشغيل البوت الأساسي.
     CheckChatInvite = None
 
-# Telegram channel IDs can exceed the legacy 32-bit lower bound used by
-# Pyrogram's peer classifier (for example, -1002404093511).
 pyrogram_utils.MIN_CHANNEL_ID = -10**15
 
 # --- Settings ---
@@ -29,8 +25,6 @@ BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
 OWNER_ID_RAW = (os.environ.get("OWNER_ID") or "").strip()
 API_ID_RAW = (os.environ.get("API_ID") or "").strip()
 API_HASH = (os.environ.get("API_HASH") or "").strip()
-# مراقبة رسائل الحسابات مفعّلة افتراضيًا حتى يلتقط البوت روابط القنوات
-# التي ترسلها البوتات داخل الكروبات والقنوات. يمكن تعطيلها صراحةً من Railway.
 ENABLE_USERBOT_MONITORING = (
     (os.environ.get("ENABLE_USERBOT_MONITORING") or "true").strip().lower()
     not in {"0", "false", "no", "off", "disabled"}
@@ -63,8 +57,13 @@ profile_userbot_tasks = {}
 profile_auto_leave_tasks = {}
 profile_account_caches = {}
 profile_account_statuses = {}
-forwarded_incoming = set()  # منع تكرار تحويل نفس الرسالة للمالك
-group_message_keys = set()  # منع عدّ نفس الرسالة مرتين عند تعدد الحسابات
+forwarded_incoming = set()
+group_message_keys = set()
+
+# حد أقصى للقنوات الإجبارية قبل مغادرة الأقدم
+MAX_JOINED_CHANNELS_PER_ACCOUNT = 400
+MAX_CHANNEL_AGE_HOURS = 24
+GROUP_RETRY_MINUTES = 15
 
 # --- Load/Save Data ---
 def default_profile_data():
@@ -89,14 +88,14 @@ def default_profile_data():
         "account_errors": {},
         "last_group_index": {},
         "last_sent_group_index": -1,
-        "template_index": 0,
         "incoming_messages": {},
         "account_blocked_groups": {},
         "account_group_posts": {},
         "account_group_incoming": {},
         "account_group_last_sent": {},
+        "account_group_waits": {},
         "group_unread_counts": {},
-        "auto_join_groups": True
+        "auto_join_groups": True,
     }
 
 
@@ -109,6 +108,9 @@ def ensure_profile_data(data):
     data.setdefault("stats", {})
     data["stats"].setdefault("sent_count", 0)
     data["stats"].setdefault("failed_count", 0)
+    waits = data.get("account_group_waits")
+    if isinstance(waits, list):
+        data["account_group_waits"] = {}
     return data
 
 
@@ -225,8 +227,6 @@ def load_data():
         print(f"Warning: {DATA_FILE} does not contain a JSON object. Starting with default data.")
         return reset_to_default_data()
 
-    # البيانات القديمة كانت ملفًا مسطحًا لبوت واحد. نحولها تلقائيًا
-    # إلى المجموعة الأولى حتى لا تضيع الحسابات أو الكليشات أو الكروبات.
     if isinstance(raw_data.get("profiles"), list):
         stored_profiles = []
         for index, stored in enumerate(raw_data["profiles"], 1):
@@ -252,6 +252,7 @@ def load_data():
     profile_store["active_profile_id"] = "profile_1"
     return legacy_data
 
+
 def save_data(data=None):
     if data is None or isinstance(data, ProfileDBProxy):
         data = current_profile_record()["data"]
@@ -276,7 +277,6 @@ def save_data(data=None):
     try:
         with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=4)
-            # fsync بعد كل رسالة كان يجمّد حلقة asyncio ويؤخر ردود البوت.
             f.flush()
         os.replace(temp_path, DATA_FILE)
     except Exception:
@@ -285,6 +285,17 @@ def save_data(data=None):
         except OSError:
             pass
         raise
+
+
+def _cleanup_session_file(name):
+    """حذف ملف .session اليتيم إن وُجد."""
+    path = f"{name}.session"
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError as error:
+        print(f"⚠️ Could not remove session file {path}: {error}")
+
 
 load_data()
 db = ProfileDBProxy()
@@ -343,15 +354,10 @@ def profile_menu_text():
 
 
 def all_profiles_stats_text():
-    """إنشاء ملخص إحصائيات كل المجموعات في رسالة واحدة."""
     profiles = profile_store.get("profiles", [])
     totals = {
-        "accounts": 0,
-        "templates": 0,
-        "groups": 0,
-        "sent": 0,
-        "failed": 0,
-        "incoming": 0,
+        "accounts": 0, "templates": 0, "groups": 0,
+        "sent": 0, "failed": 0, "incoming": 0,
     }
     lines = ["📊 إحصائيات جميع المجموعات", ""]
 
@@ -378,7 +384,6 @@ def all_profiles_stats_text():
             f"كليشات: {template_count} | إرسال: {sent_count} | "
             f"فشل: {failed_count} | ردود: {incoming_count}"
         )
-
         totals["accounts"] += account_count
         totals["templates"] += template_count
         totals["groups"] += group_count
@@ -389,21 +394,18 @@ def all_profiles_stats_text():
     if not profiles:
         return "📊 لا توجد مجموعات منفصلة."
 
-    lines.extend(
-        [
-            "",
-            "📌 الإجمالي الكلي",
-            f"الحسابات: {totals['accounts']} | الكروبات: {totals['groups']} | "
-            f"الكليشات: {totals['templates']}",
-            f"تم الإرسال: {totals['sent']} | فشل الإرسال: {totals['failed']} | "
-            f"الردود الواردة: {totals['incoming']}",
-        ]
-    )
+    lines.extend([
+        "",
+        "📌 الإجمالي الكلي",
+        f"الحسابات: {totals['accounts']} | الكروبات: {totals['groups']} | "
+        f"الكليشات: {totals['templates']}",
+        f"تم الإرسال: {totals['sent']} | فشل الإرسال: {totals['failed']} | "
+        f"الردود الواردة: {totals['incoming']}",
+    ])
     return "\n".join(lines)
 
 
 def failed_messages_text():
-    """عرض آخر محاولات الإرسال مجمعة حسب الكروب ثم رقم الحساب."""
     failures = db.get("failed_messages") or []
     if not failures:
         return "✅ لا توجد رسائل فاشلة مسجلة حاليًا."
@@ -442,7 +444,6 @@ def failed_messages_text():
 
 
 def empty_profile_data():
-    """إنشاء مجموعة جديدة بنفس هيكل البوت الحالية ولكن بلا معلومات."""
     new_data = default_profile_data()
     new_data["timer"] = int(db.get("timer", 60) or 60)
     new_data["auto_join_groups"] = bool(db.get("auto_join_groups", True))
@@ -481,8 +482,6 @@ async def activate_profile(index):
 
 
 # --- Bot Client ---
-# The bot-token client does not need a persistent login session. Keeping its
-# peer cache in memory also avoids reusing an outdated SQLite session.
 app = Client(
     "auto_post_bot",
     api_id=API_ID,
@@ -547,7 +546,7 @@ def get_menu_action(text):
             return action
     return None
 
-# --- 🛠️ دالة استخراج الروابط (محسّنة بقوة) ---
+# --- دالة استخراج الروابط ---
 def extract_all_links(message: Message):
     links = []
     seen = set()
@@ -556,7 +555,6 @@ def extract_all_links(message: Message):
         if not value:
             return
         value = str(value).strip().rstrip(".,;:!?)]}")
-        # Telegram buttons sometimes use tg:// instead of an https invite URL.
         value = re.sub(
             r"tg://join\?invite=([\w-]+)",
             r"https://t.me/+\1",
@@ -600,15 +598,9 @@ def clean_group_link(link):
     link = re.sub(r"(?i)^https?://telegram\.me/", "https://t.me/", link)
     link = re.sub(r"(?i)^telegram\.me/", "t.me/", link)
     link = re.sub(r"(?i)^tg://join\?invite=([\w-]+)$", r"https://t.me/+\1", link)
-    # A t.me/c/<channel_id>/<message_id> URL identifies a private channel.
-    # Convert it to Telegram's peer form before attempting the join.
-    private_message_link = re.match(
-        r"^(?:https?://)?t\.me/c/(\d+)(?:/\d+)?(?:[?#].*)?$",
-        link,
-        flags=re.IGNORECASE,
-    )
-    if private_message_link:
-        return f"-100{private_message_link.group(1)}"
+    # رابط t.me/c/<id> لا يُحوَّل لأيدي رقمي؛ يُحل داخل جلسة الحساب عبر get_chat
+    if re.match(r"^(?:https?://)?t\.me/c/\d+", link, flags=re.IGNORECASE):
+        return link.rstrip("/")
     link = re.sub(r"[?#].*$", "", link)
     if re.fullmatch(r"-?\d+", link):
         return link
@@ -617,7 +609,7 @@ def clean_group_link(link):
             "http://t.me/" if link.startswith("http://t.me/") else "t.me/"
         )
         suffix = link[len(prefix):]
-        if suffix.startswith(("+", "joinchat/")):
+        if suffix.startswith(("+", "joinchat/", "c/")):
             return link
         suffix = suffix.split("/", 1)[0]
         return f"@{suffix}"
@@ -650,17 +642,17 @@ def is_private_invite_link(value):
     )
 
 
-async def get_account_group_target(client, group):
-    """حل هدف الدردشة داخل جلسة الحساب الحالية فقط.
+def is_private_channel_link(value):
+    """رابط قناة/كروب خاص بصيغة t.me/c/<id>."""
+    return bool(re.match(r"^(?:https?://)?t\.me/c/\d+", str(value or ""), flags=re.IGNORECASE))
 
-    لا نستخدم group_chat_ids كحل أخير؛ فهو مخزن مشترك بين الحسابات وقد
-    يحتوي على Peer غير موجود في SQLite الخاصة بجلسة الحساب الحالية.
-    """
+
+async def get_account_group_target(client, group):
+    """حل هدف الدردشة داخل جلسة الحساب الحالية فقط."""
     clean_group = clean_group_link(group)
     if not clean_group:
         return clean_group
 
-    # اسم المستخدم العام يمكن لـ Pyrogram حله أثناء الإرسال.
     if clean_group.startswith("@"):
         return clean_group
 
@@ -670,8 +662,17 @@ async def get_account_group_target(client, group):
             chat_info = await client.get_chat(clean_group)
         except Exception:
             chat_info = await get_chat_from_private_invite(client, clean_group)
+    elif is_private_channel_link(clean_group):
+        try:
+            chat_info = await client.get_chat(clean_group)
+        except Exception as error:
+            db.setdefault("group_chat_ids", {}).pop(clean_group, None)
+            save_data(db)
+            raise ValueError(
+                f"PEER_ID_INVALID: cannot resolve private channel link {clean_group}; "
+                "make sure the account is a member and try again"
+            ) from error
     elif re.fullmatch(r"-?\d+", clean_group):
-        # يجب إدخال الـ peer في SQLite الخاصة بهذا الحساب قبل الإرسال.
         try:
             chat_info = await client.get_chat(int(clean_group))
         except Exception as error:
@@ -714,8 +715,6 @@ async def get_chat_from_private_invite(client, invite_link):
         invite_state = await client.invoke(CheckChatInvite(hash=match.group(1)))
         chat = getattr(invite_state, "chat", None)
         if chat is not None:
-            # CheckChatInvite يعيد معلومات الكروب فقط، لكنه لا يضيف الـ peer
-            # إلى SQLite storage. بدون ذلك يفشل send_message عند استخدام الـ ID.
             try:
                 await client.fetch_peers([chat])
             except Exception as error:
@@ -724,13 +723,6 @@ async def get_chat_from_private_invite(client, invite_link):
     except Exception as error:
         print(f"⚠️ Could not resolve private invite {invite_link}: {error}")
         return None
-
-
-GROUP_RETRY_MINUTES = 15
-# عدد رسائل المستخدمين المطلوبة قبل إعادة استخدام الكروب للحساب نفسه.
-# لا نعتمد على unread_messages_count لأن حسابات Userbot قد تجعل الرسائل مقروءة
-# تلقائيًا رغم أن الكروب نشط.
-UNREAD_MESSAGES_THRESHOLD = 10
 
 
 def get_account_group_blocks(account_number):
@@ -746,7 +738,6 @@ def get_account_group_blocks(account_number):
 
 
 def parse_activity_time(value):
-    """تحويل وقت التفاعل إلى قيمة قابلة للمقارنة مع دعم البيانات القديمة."""
     if isinstance(value, datetime):
         parsed = value
         return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
@@ -770,12 +761,11 @@ def get_account_group_post_state(account_number, group):
 
 def can_account_post_to_group(account_number, group, latest_time=None):
     """السماح بالنشر عند وجود نشاط أحدث من آخر نشر للحساب."""
-    post_count, incoming_count = get_account_group_post_state(account_number, group)
-    if post_count == 0 or incoming_count >= UNREAD_MESSAGES_THRESHOLD:
+    post_count, _ = get_account_group_post_state(account_number, group)
+    if post_count == 0:
         return True
     if latest_time is None:
         return False
-
     account_key = str(account_number)
     last_sent_raw = (
         db.get("account_group_last_sent", {})
@@ -783,8 +773,6 @@ def can_account_post_to_group(account_number, group, latest_time=None):
         .get(group)
     )
     last_sent_time = parse_activity_time(last_sent_raw)
-    # البيانات القديمة لا تحتوي وقت آخر إرسال؛ نسمح بعملية استعادة واحدة
-    # ثم نبدأ بتتبع الوقت من الإرسال التالي.
     if last_sent_time is None:
         return True
     return latest_time > last_sent_time + timedelta(seconds=2)
@@ -817,14 +805,10 @@ async def get_group_dialog_states(client):
             except Exception:
                 continue
 
-        # بعض إصدارات Pyrogram لا تضع top_message داخل get_dialogs().
-        # نحتفظ بحالة الحوار أولًا، ثم نقرأ آخر رسالة مباشرة للكروبات
-        # التي لم تظهر لها حالة حتى لا نرفض كروبًا نشطًا بلا سبب.
         async for dialog in client.get_dialogs():
             group = get_configured_group_for_chat(getattr(dialog, "chat", None))
             if not group:
                 continue
-
             unread_count = int(getattr(dialog, "unread_messages_count", 0) or 0)
             top_message = getattr(dialog, "top_message", None)
             latest_time = parse_activity_time(getattr(top_message, "date", None))
@@ -834,7 +818,6 @@ async def get_group_dialog_states(client):
                 )
             if latest_time is None:
                 continue
-
             states[group] = {
                 "unread_count": unread_count,
                 "last_message_time": latest_time,
@@ -842,9 +825,8 @@ async def get_group_dialog_states(client):
             db.setdefault("group_unread_counts", {})[group] = unread_count
 
         missing_groups = [
-            configured_group
-            for configured_group in db.get("groups", [])
-            if configured_group not in states
+            g for g in db.get("groups", [])
+            if g not in states
         ]
         for configured_group in missing_groups:
             latest_time = None
@@ -860,7 +842,6 @@ async def get_group_dialog_states(client):
                     f"⚠️ تعذر قراءة آخر رسالة من {configured_group}: "
                     f"{str(error)[:80]}"
                 )
-
             if latest_time is None:
                 latest_time = parse_activity_time(
                     db.get("incoming_activity", {}).get(configured_group)
@@ -877,15 +858,11 @@ async def get_group_dialog_states(client):
     return states
 
 
-def get_next_group(account_number=None, dialog_states=None):
+def get_next_group(account_number=None):
     """اختيار الكروب التالي بالتناوب دون شروط نشاط أو رسائل غير مقروءة."""
     groups = db.get("groups", [])
     if not groups:
         return None
-
-    # لا ننتظر رسالة جديدة ولا unread count ولا عدد تفاعلات.
-    # كل حساب ينتقل إلى الكروب التالي في قائمته حتى تتم محاولة الإرسال
-    # إلى جميع الكروبات بالتناوب.
     account_key = str(account_number or 0)
     last_indices = db.setdefault("last_group_index", {})
     try:
@@ -898,7 +875,6 @@ def get_next_group(account_number=None, dialog_states=None):
 
 
 def advance_group_after_attempt(group):
-    """تحريك المؤشر بعد الفشل حتى لا تتكرر نفس المجموعة مع كل الحسابات."""
     groups = db.get("groups", [])
     if group in groups:
         db["last_sent_group_index"] = groups.index(group)
@@ -924,7 +900,6 @@ def is_permanent_group_error(error_text):
 
 
 def failure_guidance(error_text):
-    """تحويل الخطأ التقني إلى سبب مفهوم وحل عملي."""
     text = str(error_text or "").strip()
     upper = text.upper()
     rules = [
@@ -943,7 +918,6 @@ def failure_guidance(error_text):
 
 
 def record_failure(account_number, group, error_text, reason=None, solution=None):
-    """حفظ آخر أسباب الفشل لعرضها من زر الرسائل الفاشلة."""
     raw_text = str(error_text or "").strip()
     default_reason, default_solution = failure_guidance(raw_text)
     failures = db.setdefault("failed_messages", [])
@@ -959,7 +933,6 @@ def record_failure(account_number, group, error_text, reason=None, solution=None
 
 
 def block_account_from_group(account_number, group):
-    """تجميد الكروب لهذا الحساب مؤقتًا بدون حذفه من القائمة."""
     blocked = get_account_group_blocks(account_number)
     retry_until = datetime.now() + timedelta(minutes=GROUP_RETRY_MINUTES)
     blocked[group] = retry_until.isoformat()
@@ -968,7 +941,6 @@ def block_account_from_group(account_number, group):
 
 
 def mark_group_sent(group):
-    """حفظ آخر كروب تم الإرسال إليه دون اعتباره تفاعلاً من المستخدمين."""
     groups = db.get("groups", [])
     if group in groups:
         db["last_sent_group_index"] = groups.index(group)
@@ -982,7 +954,6 @@ def get_next_template():
     return random.choice(templates)
 
 
-# --- Get account info with caching ---
 async def get_account_info(session_str, index):
     cache_key = f"{index}_{hash(session_str)}"
     cache = get_account_cache()
@@ -1002,7 +973,7 @@ async def get_account_info(session_str, index):
         await temp_client.disconnect()
         cache[cache_key] = info
         return info
-    except:
+    except Exception:
         info = {"phone": "غير معروف", "name": "غير متصل", "connected": False, "id": None, "username": ""}
         cache[cache_key] = info
         return info
@@ -1013,7 +984,6 @@ def normalize_phone_number(phone):
 
 
 def find_account_owner_by_session(session_str):
-    """العثور على المجموعة التي تحتوي Session String نفسه."""
     normalized_session = str(session_str or "").strip()
     if not normalized_session:
         return None
@@ -1030,11 +1000,9 @@ def find_account_owner_by_session(session_str):
 
 
 async def find_account_owner_by_phone(phone):
-    """البحث عن رقم الحساب في جميع المجموعات قبل إضافته."""
     normalized_phone = normalize_phone_number(phone)
     if not normalized_phone:
         return None
-
     for profile in profile_store.get("profiles", []):
         profile_id = profile.get("id")
         accounts = (profile.get("data") or {}).get("accounts", [])
@@ -1067,7 +1035,6 @@ def duplicate_account_warning(owner, phone):
     )
 
 
-# --- 🔥 Account Status Check ---
 async def check_account_status(client, account_number):
     try:
         me = await client.get_me()
@@ -1084,62 +1051,143 @@ async def check_account_status(client, account_number):
         await notify_owner(error_msg)
         return {"status": "error", "message": error_msg}
 
+
 async def notify_owner(message):
     try:
         await app.send_message(OWNER_ID, f"⚠️ تنبيه البوت:\n{message}")
-    except:
-        print(f"⚠️ فشل إرسال إشعار للمالك: {message}")
+    except Exception as error:
+        print(f"⚠️ فشل إرسال إشعار للمالك: {message} | السبب: {error}")
 
-# --- Auto Leave Channels (24 hours) ---
-async def auto_leave_channels():
-    global db
-    while True:
+
+# --- المغادرة التلقائية (بعد 24 ساعة + الأقدم عند الامتلاء) ---
+async def _leave_channel_for_account(user_app, account_index, channel):
+    clean_link = clean_group_link(channel)
+    if not clean_link:
+        return False
+    try:
+        target = get_group_chat_target(channel)
+    except Exception:
+        target = clean_link
+    try:
+        await user_app.leave_chat(target)
+        print(f"🚪 Acc {account_index + 1} left {clean_link}")
+        return True
+    except Exception as error:
+        print(f"❌ Leave {clean_link} failed for acc {account_index + 1}: {error}")
+        return False
+
+
+def _prune_channel_records(channel):
+    db["joined_channels"].pop(channel, None)
+    db["channel_join_time"].pop(channel, None)
+    for account_channels in db.get("account_joined_channels", {}).values():
+        if isinstance(account_channels, dict):
+            account_channels.pop(channel, None)
+
+
+def _oldest_channels(limit):
+    timestamps = db.get("channel_join_time", {})
+    joined = db.get("joined_channels", {})
+    pairs = []
+    for channel in joined:
+        raw = timestamps.get(channel)
         try:
-            now = datetime.now()
-            to_remove = []
-            for channel, join_time in db.get("joined_channels", {}).items():
-                try:
-                    join_dt = datetime.fromisoformat(join_time)
-                    if now - join_dt > timedelta(hours=24):
-                        to_remove.append(channel)
-                except:
-                    to_remove.append(channel)
-            for channel in to_remove:
-                success = True
-                for idx, session_str in enumerate(db["accounts"]):
-                    user_app = None
+            parsed = datetime.fromisoformat(raw) if raw else datetime.min
+        except (TypeError, ValueError):
+            parsed = datetime.min
+        pairs.append((parsed, channel))
+    pairs.sort(key=lambda item: item[0])
+    return [channel for _, channel in pairs[:limit]]
+
+
+async def auto_leave_channels(profile_id=None):
+    """مغادرة القنوات التي تجاوزت 24 ساعة أو الأقدم عند امتلاء الحساب."""
+    token = None
+    if profile_id and profile_id != current_profile_id():
+        token = profile_context.set(profile_id)
+    try:
+        while True:
+            try:
+                now = datetime.now()
+                expired = []
+                for channel, join_time in list(db.get("joined_channels", {}).items()):
                     try:
-                        user_app = Client(f"leave_session_{idx}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
-                        await user_app.start()
-                        await user_app.leave_chat(get_group_chat_target(channel))
-                        print(f"🚪 Acc {idx+1} left {channel}")
-                    except Exception as e:
-                        success = False
-                        print(f"❌ Leave {channel} failed: {e}")
-                    finally:
-                        if user_app:
-                            try:
-                                await user_app.stop()
-                            except Exception:
-                                pass
-                if success:
-                    db["joined_channels"].pop(channel, None)
-                    db["channel_join_time"].pop(channel, None)
-                    for account_channels in db.get("account_joined_channels", {}).values():
-                        account_channels.pop(channel, None)
-                    save_data(db)
-            await asyncio.sleep(3600)
-        except Exception as e:
-            print(f"❌ Auto leave error: {e}")
-            await asyncio.sleep(60)
+                        join_dt = datetime.fromisoformat(join_time)
+                        if now - join_dt > timedelta(hours=MAX_CHANNEL_AGE_HOURS):
+                            expired.append(channel)
+                    except (TypeError, ValueError):
+                        expired.append(channel)
 
-def ensure_auto_leave_task():
-    """المغادرة التلقائية معطلة؛ القنوات تبقى للحسابات دون حد زمني."""
-    return
+                current_count = len(db.get("joined_channels", {}))
+                overflow = max(0, current_count - MAX_JOINED_CHANNELS_PER_ACCOUNT)
+                overflow_channels = _oldest_channels(overflow) if overflow else []
+                to_leave = list(dict.fromkeys(expired + overflow_channels))
 
-# --- Join channel for all accounts ---
+                for channel in to_leave:
+                    success = True
+                    for idx, session_str in enumerate(db.get("accounts", [])):
+                        user_app = None
+                        try:
+                            user_app = Client(
+                                f"leave_session_{current_profile_id()}_{idx}",
+                                api_id=API_ID,
+                                api_hash=API_HASH,
+                                session_string=session_str,
+                            )
+                            await user_app.start()
+                            if not await _leave_channel_for_account(user_app, idx, channel):
+                                success = False
+                        except Exception as error:
+                            success = False
+                            print(f"❌ Leave {channel} failed for acc {idx+1}: {error}")
+                        finally:
+                            if user_app:
+                                try:
+                                    await user_app.stop()
+                                except Exception:
+                                    pass
+                    if success:
+                        _prune_channel_records(channel)
+                        save_data(db)
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                print(f"❌ Auto leave loop error: {error}")
+                await asyncio.sleep(60)
+    finally:
+        if token is not None:
+            profile_context.reset(token)
+
+
+auto_leave_tasks = {}
+
+
+def ensure_auto_leave_task(profile_id=None):
+    """تشغيل مهمة مغادرة واحدة لكل profile إذا لم تكن تعمل."""
+    profile_id = profile_id or current_profile_id()
+    task = auto_leave_tasks.get(profile_id)
+    if task and not task.done():
+        return task
+    task = asyncio.create_task(auto_leave_channels(profile_id))
+    auto_leave_tasks[profile_id] = task
+    print(f"🚪 Auto-leave task started for {profile_id}")
+    return task
+
+
+async def stop_auto_leave_task(profile_id=None):
+    profile_id = profile_id or current_profile_id()
+    task = auto_leave_tasks.pop(profile_id, None)
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+# --- Join channel for account ---
 async def join_channel_for_account(session_str, account_index, channel):
-    """ضم حساب واحد إلى كروب واحد مع حفظ أيدي الدردشة للاختيار الدقيق."""
     clean_link = clean_group_link(channel)
     if not clean_link:
         return False
@@ -1148,7 +1196,6 @@ async def join_channel_for_account(session_str, account_index, channel):
     account_joined_channels = db.setdefault("account_joined_channels", {})
     already_confirmed = account_joined_channels.get(account_key, {}).get(clean_link) is True
     if already_confirmed:
-        # أعد التحقق داخل جلسة الحساب؛ الـ ID العام قديم أو يخص حسابًا آخر.
         print(f"🔄 Acc {account_index + 1} rechecking membership in {clean_link}")
 
     user_app = None
@@ -1201,16 +1248,15 @@ async def join_channel_for_account(session_str, account_index, channel):
                 await user_app.stop()
             except Exception:
                 pass
+        _cleanup_session_file(f"join_session_{current_profile_id()}_{account_index}")
     return joined
 
 
 async def join_account_to_configured_groups(session_str, account_index):
-    """عند إضافة رقم جديد، ينضم الحساب أولاً إلى القنوات الإجبارية ثم الكروبات."""
     groups = list(db.get("groups", []))
     mandatory_channels = list(db.get("joined_channels", {}).keys())
     joined_count = 0
 
-    # الأولوية للقنوات الإجبارية: لا نؤجلها إلى ما بعد الكروبات.
     for channel in mandatory_channels:
         await join_channel_for_account(session_str, account_index, channel)
 
@@ -1224,7 +1270,6 @@ async def join_account_to_configured_groups(session_str, account_index):
 
 
 async def join_all_accounts_to_configured_groups():
-    """فحص وانضمام كل الحسابات إلى كل الكروبات قبل بدء الإرسال."""
     results = []
     for account_index, session_str in enumerate(list(db.get("accounts", []))):
         try:
@@ -1274,12 +1319,16 @@ async def join_channel_for_all_accounts(channel, track_for_auto_leave=True):
         join_time = datetime.now().isoformat()
         db["joined_channels"][clean_link] = join_time
         db["channel_join_time"][clean_link] = join_time
+        # بعد إضافة قناة جديدة، إن تجاوزنا الحد الأقصى، شغّل المغادرة فورًا
+        if len(db.get("joined_channels", {})) > MAX_JOINED_CHANNELS_PER_ACCOUNT:
+            ensure_auto_leave_task()
         save_data(db)
-        print(f"✅ Mandatory channel {clean_link} saved; automatic leaving is disabled")
+        print(f"✅ Mandatory channel {clean_link} saved")
     elif joined_any:
-        print(f"✅ All accounts checked/joined posting group {clean_link}; it will remain in the list")
+        print(f"✅ All accounts checked/joined posting group {clean_link}")
 
-# --- 🚀 MAIN POSTING LOOP ---
+
+# --- MAIN POSTING LOOP ---
 async def ensure_account_in_group(client, group, account_number):
     """التأكد من العضوية قبل الإرسال مع احترام FLOOD_WAIT لكل حساب وكروب."""
     clean_link = clean_group_link(group) or str(group)
@@ -1309,7 +1358,6 @@ async def ensure_account_in_group(client, group, account_number):
     account_memberships = db.setdefault("account_joined_channels", {})
     known_member = account_memberships.get(account_key, {}).get(clean_link) is True
     if known_member:
-        # لا نعتمد على السجل فقط؛ نتحقق من العضوية فعليًا في كل محاولة إرسال.
         try:
             resolved_chat = await client.get_chat(clean_link)
             resolved_id = getattr(resolved_chat, "id", None)
@@ -1326,8 +1374,6 @@ async def ensure_account_in_group(client, group, account_number):
         except Exception:
             pass
 
-    # نستخدم الرابط/المعرف المهيأ داخل جلسة الحساب، وليس Chat ID عامًا قديمًا.
-
     chat_target = clean_group
     try:
         member = await client.get_chat_member(chat_target, "me")
@@ -1342,8 +1388,6 @@ async def ensure_account_in_group(client, group, account_number):
     except Exception:
         pass
 
-    # عند استخدام رقم Chat ID غير معروف في جلسة الحساب، حاول حل الرابط أولًا
-    # قبل استدعاء ImportChatInvite مرة أخرى.
     try:
         resolved_chat = await client.get_chat(clean_link)
         resolved_id = getattr(resolved_chat, "id", None)
@@ -1372,7 +1416,6 @@ async def ensure_account_in_group(client, group, account_number):
     except Exception as error:
         error_text = str(error).upper()
         if "ALREADY_PARTICIPANT" in error_text or "USER_ALREADY_PARTICIPANT" in error_text:
-            # العضوية وحدها لا تكفي: نحتاج Peer قابلًا للحل في جلسة الحساب.
             try:
                 resolved_chat = await client.get_chat(clean_link)
                 resolved_id = getattr(resolved_chat, "id", None)
@@ -1394,14 +1437,21 @@ async def ensure_account_in_group(client, group, account_number):
         return False, permanent
 
 
-async def auto_posting_loop():
-    global db
+async def auto_posting_loop(profile_id=None):
+    """حلقة نشر مستقلة لكل profile، لا تعتمد على ContextVar الخارجي."""
+    token = None
+    if profile_id and profile_id != current_profile_id():
+        token = profile_context.set(profile_id)
     active_clients = []
     account_info = []
     try:
         for idx, session_str in enumerate(db["accounts"]):
             try:
-                client = Client(f"active_session_{current_profile_id()}_{idx}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+                client = Client(
+                    f"active_session_{current_profile_id()}_{idx}",
+                    api_id=API_ID, api_hash=API_HASH,
+                    session_string=session_str,
+                )
                 await client.start()
                 me = await client.get_me()
                 active_clients.append(client)
@@ -1437,15 +1487,13 @@ async def auto_posting_loop():
             return
 
         print(f"🚀 Starting with {len(valid_accounts)} active accounts, interval: {timer_value}s")
-        await notify_owner(f"🚀 بدء تشغيل البوت\n📊 {len(valid_accounts)} حساب نشط\n⏱ الفاصل بين كل إرسال: {timer_value} ثانية")
+        await notify_owner(f"🚀 بدء تشغيل البوت\n📊 {len(valid_accounts)} حساب نشط\n⏱ الفاصل: {timer_value} ثانية")
 
         consecutive_errors = {info["number"]: 0 for info in valid_accounts}
         max_errors = 5
-        # منع إرسالين متزامنين من نفس الحساب إلى مجموعتين مختلفتين.
         account_send_locks = {info["number"]: asyncio.Lock() for info in valid_accounts}
 
         async def post_to_group(acc_info, group):
-            """تشغيل إرسال مستقل لكل كروب حتى لا تمنع مجموعةٌ بقية المجموعات."""
             if not db["is_running"]:
                 return
             client = acc_info["client"]
@@ -1461,9 +1509,7 @@ async def auto_posting_loop():
                     if not joined:
                         db["stats"]["failed_count"] += 1
                         record_failure(
-                            acc_number,
-                            group,
-                            "GROUP_JOIN_FAILED",
+                            acc_number, group, "GROUP_JOIN_FAILED",
                             reason="لم يتمكن الحساب من الوصول إلى المجموعة أو الانضمام إليها.",
                             solution="أعد إضافة المجموعة باستخدام @username أو رابط دعوة صحيح، وتأكد أن الحساب عضو فيها.",
                         )
@@ -1482,8 +1528,7 @@ async def auto_posting_loop():
                     if status["status"] != "active":
                         db["stats"]["failed_count"] += 1
                         record_failure(
-                            acc_number,
-                            group,
+                            acc_number, group,
                             status.get("message") or status.get("status"),
                             reason="الحساب غير نشط أو لم يتمكن Telegram من التحقق منه.",
                             solution="افحص جلسة الحساب، أعد تسجيل الدخول إذا لزم، ثم شغّل البوت من جديد.",
@@ -1535,7 +1580,6 @@ async def auto_posting_loop():
                 advance_group_after_attempt(group)
                 if is_permanent_group_error(error_text):
                     block_account_from_group(acc_number, group)
-                    print(f"⏭️ Account {acc_number} will skip {group}: no send permission or invalid peer")
 
         while db["is_running"]:
             if not db["accounts"] or not db["templates"] or not db["groups"]:
@@ -1543,8 +1587,6 @@ async def auto_posting_loop():
                 save_data(db)
                 break
 
-            # كل كروب يحصل على مهمة مستقلة، والحسابات تتناوب بين الجولات.
-            # مثال: حساب 1 ثم حساب 2 ثم حساب 1 عند وجود كروب واحد.
             groups_this_round = list(db.get("groups", []))
             group_tasks = []
             rotation_index = int(db.get("account_rotation_index", 0) or 0) % len(valid_accounts)
@@ -1559,25 +1601,31 @@ async def auto_posting_loop():
 
             db["account_rotation_index"] = (rotation_index + 1) % len(valid_accounts)
             save_data(db)
+    except asyncio.CancelledError:
+        print(f"🛑 Posting loop cancelled for {profile_id or current_profile_id()}")
+        raise
     except Exception as e:
         error_msg = f"❌ خطأ رئيسي في حلقة النشر: {str(e)}"
         print(f"❌ {error_msg}")
         await notify_owner(error_msg)
     finally:
-        for client in active_clients:
+        for idx, client in enumerate(active_clients):
             if client:
                 try:
                     await client.stop()
-                except:
+                except Exception:
                     pass
+            _cleanup_session_file(f"active_session_{current_profile_id()}_{idx}")
         if db["is_running"]:
             db["is_running"] = False
             save_data(db)
             await notify_owner("🛑 تم إيقاف البوت تلقائياً بسبب خطأ")
+        if token is not None:
+            profile_context.reset(token)
 
-# ===== ⭐ جديد: مراقبة الحسابات (Userbots) لاستقبال رسائل البوتات في الكروبات =====
+
+# ===== مراقبة الحسابات (Userbots) =====
 def is_bot_generated_message(message):
-    """اعتبار الرسالة آلية إذا أرسلها بوت أو كانت من خلال بوت."""
     sender = getattr(message, "from_user", None)
     via_bot = getattr(message, "via_bot", None)
     return bool(
@@ -1587,14 +1635,12 @@ def is_bot_generated_message(message):
 
 
 def is_channel_post(message):
-    """تمييز منشورات القنوات دون اعتبارها رسائل أعضاء عادية."""
     chat = getattr(message, "chat", None)
     chat_type = str(getattr(chat, "type", "") or "").lower()
     return chat_type.rsplit(".", 1)[-1] == "channel"
 
 
 def is_automated_or_channel_message(_, __, message):
-    """فلتر ضيق للبوتات ومنشورات القنوات والرسائل المرسلة باسم قناة."""
     return bool(
         is_bot_generated_message(message)
         or is_channel_post(message)
@@ -1609,7 +1655,6 @@ AUTOMATED_OR_CHANNEL_FILTER = filters.create(
 
 
 def get_message_context(chat_id, message_id):
-    """العثور على معلومات الرسالة المرسلة أو المحفوظة من كروب."""
     for collection in ("outgoing_messages", "incoming_messages"):
         chat_messages = db.get(collection, {}).get(str(chat_id), {})
         info = chat_messages.get(message_id) or chat_messages.get(str(message_id))
@@ -1619,13 +1664,11 @@ def get_message_context(chat_id, message_id):
 
 
 def get_outgoing_message_context(chat_id, message_id):
-    """العثور فقط على رسالة أرسلها أحد الحسابات، وليس رسالة واردة من مستخدم."""
     chat_messages = db.get("outgoing_messages", {}).get(str(chat_id), {})
     return chat_messages.get(message_id) or chat_messages.get(str(message_id))
 
 
 def get_configured_group_for_chat(chat):
-    """مطابقة دردشة تيليغرام مع الكروب المسجل حتى مع اختلاف صيغة الرابط."""
     if not chat:
         return None
     chat_id = str(getattr(chat, "id", ""))
@@ -1644,7 +1687,6 @@ def get_configured_group_for_chat(chat):
 
 
 def record_group_interaction(message):
-    """تسجيل آخر رسالة وزيادة عداد الرسائل بعد آخر نشر لكل حساب."""
     if not message.from_user or message.from_user.is_bot:
         return
     group = get_configured_group_for_chat(message.chat)
@@ -1654,7 +1696,7 @@ def record_group_interaction(message):
     message_key = (str(message.chat.id), message.id)
     if message_key not in group_message_keys:
         group_message_keys.add(message_key)
-        if len(group_message_keys) > 10000:
+        if len(group_message_keys) > 50000:
             group_message_keys.clear()
         db.setdefault("incoming_activity", {})[group] = datetime.now().isoformat()
         for account_key, posts_by_group in db.get("account_group_posts", {}).items():
@@ -1669,7 +1711,6 @@ def record_group_interaction(message):
 
 
 async def forward_group_message_to_owner(message, source_account=None):
-    """تسجيل التفاعل وحفظ الردود المباشرة على رسائل الحسابات فقط."""
     if not message.from_user or message.from_user.is_bot:
         return
 
@@ -1679,7 +1720,6 @@ async def forward_group_message_to_owner(message, source_account=None):
     if not replied:
         return
 
-    # لا نحتسب إلا الرد على رسالة مرسلة من أحد حساباتنا
     reply_info = get_outgoing_message_context(chat_id, replied.id)
     if not reply_info:
         return
@@ -1714,11 +1754,14 @@ async def forward_group_message_to_owner(message, source_account=None):
     save_data(db)
     print(f"📩 Saved reply from {message.from_user.id} in {chat_id} for account {account_number}")
 
-async def start_userbot_monitor(session_str, index):
-    """تشغيل عميل لكل حساب لمراقبة الروابط والرسائل في الكروبات."""
-    client = Client(f"userbot_{current_profile_id()}_{index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
 
-    # لا نراقب رسائل الأعضاء العادية: بوتات داخل الكروبات أو منشورات القنوات فقط.
+async def start_userbot_monitor(session_str, index):
+    client = Client(
+        f"userbot_{current_profile_id()}_{index}",
+        api_id=API_ID, api_hash=API_HASH,
+        session_string=session_str,
+    )
+
     @client.on_message(filters.incoming & AUTOMATED_OR_CHANNEL_FILTER)
     async def userbot_message_handler(ub_client, message):
         try:
@@ -1728,7 +1771,6 @@ async def start_userbot_monitor(session_str, index):
                 for link in links:
                     await join_channel_for_all_accounts(link)
         except Exception as error:
-            # لا نسمح لرسالة ذات Peer قديم بإسقاط معالج التحديثات بالكامل.
             print(f"⚠️ Userbot {index+1} skipped an update: {error}")
 
     try:
@@ -1736,14 +1778,19 @@ async def start_userbot_monitor(session_str, index):
         print(f"✅ Userbot {index+1} started monitoring groups")
         while True:
             await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         print(f"❌ Userbot {index+1} failed: {str(e)[:80]}")
     finally:
-        await client.stop()
+        try:
+            await client.stop()
+        except Exception:
+            pass
+        _cleanup_session_file(f"userbot_{current_profile_id()}_{index}")
 
 
 async def start_all_userbots():
-    """تشغيل حسابات المراقبة الخاصة بملف التشغيل الحالي عند تفعيلها صراحةً."""
     profile_id = current_profile_id()
     await stop_all_userbots(profile_id)
     if not ENABLE_USERBOT_MONITORING:
@@ -1757,7 +1804,8 @@ async def start_all_userbots():
         tasks.append(task)
     print(f"🚀 Started monitoring {len(tasks)} accounts for {profile_id}")
 
-# --- ✅ المعالج الأهم والأول: أي رسالة من بوت تحتوي روابط (يعمل إذا كان البوت الرئيسي عضواً) ---
+
+# --- معالج رسائل البوتات في الكروبات ---
 @app.on_message(
     filters.incoming & AUTOMATED_OR_CHANNEL_FILTER,
     group=0,
@@ -1783,7 +1831,7 @@ async def handle_bot_messages_with_links(client: Client, message: Message):
         except Exception as error:
             print(f"⚠️ Main bot skipped auto-join update: {error}")
 
-# --- Handle incoming group messages and replies ---
+
 @app.on_message(
     filters.incoming & AUTOMATED_OR_CHANNEL_FILTER,
     group=1,
@@ -1794,7 +1842,7 @@ async def handle_user_replies(client: Client, message: Message):
     except Exception as error:
         print(f"⚠️ Main bot skipped group update: {error}")
 
-# --- Handle private messages from users (non-owner) ---
+
 @app.on_message(filters.private & filters.incoming & ~filters.user(OWNER_ID), group=2)
 async def handle_private_messages(client: Client, message: Message):
     if not message.from_user:
@@ -1818,7 +1866,8 @@ async def handle_private_messages(client: Client, message: Message):
 """
     await app.send_message(OWNER_ID, user_info)
 
-# --- MAIN HANDLER FOR OWNER (UNIFIED) ---
+
+# --- MAIN HANDLER FOR OWNER ---
 @app.on_message(filters.private & filters.user(OWNER_ID) & filters.text, group=3)
 async def handle_owner_commands(client: Client, message: Message):
     profile_context.set(profile_store.get("active_profile_id", "profile_1"))
@@ -1851,10 +1900,15 @@ async def handle_owner_commands(client: Client, message: Message):
                     account_index = account_number - 1
                     if account_index < len(db["accounts"]):
                         session_str = db["accounts"][account_index]
-                        user_client = Client(f"reply_client_{current_profile_id()}_{account_index}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+                        user_client = Client(
+                            f"reply_client_{current_profile_id()}_{account_index}",
+                            api_id=API_ID, api_hash=API_HASH,
+                            session_string=session_str,
+                        )
                         await user_client.start()
                         await user_client.send_message(chat_id, reply_text, reply_to_message_id=message_id)
                         await user_client.stop()
+                        _cleanup_session_file(f"reply_client_{current_profile_id()}_{account_index}")
                         await message.reply_text(f"✅ تم إرسال الرد من الحساب {account_number}")
                     else:
                         await message.reply_text("❌ الحساب غير موجود")
@@ -1880,8 +1934,6 @@ async def handle_owner_commands(client: Client, message: Message):
         or get_profile_index_by_name(text) is not None
     )
     if state and navigation_pressed:
-        # أي زر من أزرار القائمة يلغي الإدخال الجاري، مثل انتظار رقم الهاتف
-        # أو OTP أو كلمة مرور التحقق، ثم يسمح للمعالج بتنفيذ الزر الجديد.
         pending_login = login_sessions.pop(OWNER_ID, None)
         if pending_login:
             try:
@@ -1945,7 +1997,6 @@ async def handle_owner_commands(client: Client, message: Message):
 
             temp_client = None
             try:
-                # جلسة مؤقتة داخل الذاكرة تمنع تعارض ملفات .session القديمة.
                 temp_client = Client(
                     session_name,
                     api_id=API_ID,
@@ -2248,48 +2299,75 @@ async def handle_owner_commands(client: Client, message: Message):
         elif action == "start":
             profile_id = current_profile_id()
             posting_task = profile_posting_tasks.get(profile_id)
-            if db["is_running"]:
-                # بعد إعادة التشغيل قد تبقى الراية محفوظة بينما لا توجد مهمة فعلية
-                if posting_task is not None and not posting_task.done():
-                    return await message.reply_text("⚠️ البوت يعمل حاليًا.")
+
+            # حالة غير متناسقة: is_running محفوظ لكن لا توجد مهمة فعلية
+            if db["is_running"] and (posting_task is None or posting_task.done()):
+                print(f"⚠️ Stale is_running for {profile_id}; resetting")
                 db["is_running"] = False
                 save_data()
+                posting_task = None
+
+            if db["is_running"] and posting_task and not posting_task.done():
+                return await message.reply_text("⚠️ البوت يعمل حاليًا.")
+
             if not db["accounts"] or not db["templates"] or not db["groups"]:
                 return await message.reply_text("❌ يجب إضافة حساب وكليشة وكروب أولًا.")
 
-            # لا نبدأ الإرسال قبل فحص عضوية كل حساب في كل كروب.
-            join_results = await join_all_accounts_to_configured_groups()
+            # تنظيف أي بقايا من تشغيل سابق
+            await stop_all_userbots(profile_id)
+            await stop_auto_leave_task(profile_id)
+
             db["is_running"] = True
             save_data()
-            await start_all_userbots()
-            posting_task = asyncio.create_task(auto_posting_loop())
-            profile_posting_tasks[profile_id] = posting_task
-            timer_value = db.get('timer', 60)
-            await message.reply_text(
-                f"🚀 تم تشغيل البوت!\n"
-                f"⏱ المؤقت: {timer_value} ثانية\n"
-                f"📊 الحسابات: {len(db['accounts'])}\n"
-                f"📢 الكروبات: {len(db['groups'])}\n"
-                f"📝 الكليشات: {len(db['templates'])}\n"
-                + "🤝 فحص انضمام الحسابات:\n"
-                + "\n".join(
-                    f"الحساب {item['account']}: {item['joined']}/{item['total']} كروب"
-                    for item in join_results
-                )
-                + "\n"
-                f"🔄 طابور حسابات متكرر بالترتيب\n"
-                "🎯 إرسال بالتناوب إلى جميع الكروبات المسجلة دون شروط نشاط\n"
-                f"📡 مراقبة الحظر والتجميد مفعلة\n"
-                f"👥 نظام الردود الآلي مفعل"
-            )
+
+            await message.reply_text("⏳ جاري فحص انضمام الحسابات إلى الكروبات...")
+
+            async def start_posting_when_ready():
+                token = profile_context.set(profile_id)
+                try:
+                    join_results = await join_all_accounts_to_configured_groups()
+                    if not db.get("is_running"):
+                        return
+                    await start_all_userbots()
+                    ensure_auto_leave_task(profile_id)
+                    task = asyncio.create_task(auto_posting_loop(profile_id))
+                    profile_posting_tasks[profile_id] = task
+                    timer_value = db.get("timer", 60)
+                    summary = "\n".join(
+                        f"الحساب {item['account']}: {item['joined']}/{item['total']} كروب"
+                        for item in join_results
+                    ) if join_results else "لا توجد كروبات مسجلة."
+                    await app.send_message(
+                        OWNER_ID,
+                        f"🚀 تم تشغيل البوت!\n"
+                        f"⏱ المؤقت: {timer_value} ثانية\n"
+                        f"📊 الحسابات: {len(db['accounts'])}\n"
+                        f"📢 الكروبات: {len(db['groups'])}\n"
+                        f"📝 الكليشات: {len(db['templates'])}\n"
+                        f"🤝 فحص انضمام الحسابات:\n{summary}\n"
+                        f"🔄 طابور حسابات متكرر بالترتيب\n"
+                        f"🎯 إرسال بالتناوب إلى جميع الكروبات المسجلة\n"
+                        f"📡 مراقبة الحظر والتجميد مفعلة"
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    print(f"❌ start_posting_when_ready failed: {error}")
+                    db["is_running"] = False
+                    save_data()
+                    await notify_owner(f"❌ فشل تشغيل {profile_id}: {error}")
+                finally:
+                    profile_context.reset(token)
+
+            asyncio.create_task(start_posting_when_ready())
 
         elif action == "stop":
             profile_id = current_profile_id()
             posting_task = profile_posting_tasks.get(profile_id)
-            if not db["is_running"]:
-                return await message.reply_text("⚠️ البوت متوقف حاليًا.")
+
             db["is_running"] = False
             save_data()
+
             if posting_task and not posting_task.done():
                 posting_task.cancel()
                 try:
@@ -2298,6 +2376,7 @@ async def handle_owner_commands(client: Client, message: Message):
                     pass
             profile_posting_tasks[profile_id] = None
             await stop_all_userbots(profile_id)
+            await stop_auto_leave_task(profile_id)
             await message.reply_text("🛑 تم إيقاف البوت لهذه المجموعة.")
 
         elif action == "timer":
@@ -2335,12 +2414,12 @@ async def handle_owner_commands(client: Client, message: Message):
             db["account_errors"] = {}
             db["last_group_index"] = {}
             db["last_sent_group_index"] = -1
-            db["template_index"] = 0
             db["incoming_messages"] = {}
             db["account_blocked_groups"] = {}
             db["account_group_posts"] = {}
             db["account_group_incoming"] = {}
             db["account_group_last_sent"] = {}
+            db["account_group_waits"] = {}
             db["group_unread_counts"] = {}
             save_data(db)
             get_account_cache().clear()
@@ -2377,8 +2456,8 @@ async def handle_owner_commands(client: Client, message: Message):
 
     await message.reply_text("لم أفهم الأمر. أرسل /start ثم اختر أحد أزرار القائمة.")
 
+
 def build_incoming_replies_keyboard():
-    """إنشاء قائمة أزرار للردود المباشرة على رسائل الحسابات."""
     keyboard = []
     for chat_id, messages in db.get("incoming_messages", {}).items():
         for msg_id, msg_info in messages.items():
@@ -2395,7 +2474,6 @@ def build_incoming_replies_keyboard():
     return InlineKeyboardMarkup(keyboard) if keyboard else None
 
 
-# --- Selection Helper ---
 def create_selection_list(items, item_type, action, context_id=None):
     keyboard = []
     for i, item in enumerate(items):
@@ -2409,10 +2487,8 @@ def create_selection_list(items, item_type, action, context_id=None):
 
 
 def remove_indexed_account_state(state, removed_index, one_based=True):
-    """حذف حالة حساب وترحيل مفاتيح الحسابات التي بعده."""
     if not isinstance(state, dict):
         return {}
-
     removed_key = removed_index + (1 if one_based else 0)
     updated = {}
     for raw_key, value in state.items():
@@ -2421,7 +2497,6 @@ def remove_indexed_account_state(state, removed_index, one_based=True):
         except (TypeError, ValueError):
             updated[raw_key] = value
             continue
-
         if key_number == removed_key:
             continue
         if key_number > removed_key:
@@ -2431,9 +2506,7 @@ def remove_indexed_account_state(state, removed_index, one_based=True):
     return updated
 
 
-
 async def _recover_session_string(session_str, db, user_id_str):
-    """التحقق من Session String وحفظه للنصوص وملفات JSON وZIP."""
     session_str = str(session_str or "").strip()
     if not session_str:
         return "❌ ملف الجلسة لا يحتوي Session String صالحاً."
@@ -2471,7 +2544,6 @@ async def _recover_session_string(session_str, db, user_id_str):
 
 
 def _session_strings_from_payload(payload):
-    """استخراج Session Strings من JSON المفرد أو القائمة."""
     if isinstance(payload, str):
         candidates = [payload]
     elif isinstance(payload, dict):
@@ -2500,7 +2572,6 @@ def _session_strings_from_payload(payload):
 
 @app.on_message(filters.private & filters.user(OWNER_ID) & filters.document, group=3)
 async def handle_owner_session_document(client: Client, message: Message):
-    """استقبال جلسات JSON أو ZIP المُصدّرة من Strat أثناء وضع الاسترداد."""
     profile_context.set(profile_store.get("active_profile_id", "profile_1"))
     user_id_str = str(OWNER_ID)
     if db.get("user_state", {}).get(user_id_str) != "WAITING_RECOVER":
@@ -2547,10 +2618,10 @@ async def handle_owner_session_document(client: Client, message: Message):
     except Exception as e:
         return await message.reply_text(f"❌ تعذر قراءة ملف الجلسة: {e}")
 
+
 # --- Handle Callback Query ---
 @app.on_callback_query()
 async def handle_callback(client: Client, callback_query):
-    global db
     if callback_query.from_user.id != OWNER_ID:
         return await callback_query.answer("غير مصرح")
     data = callback_query.data
@@ -2572,8 +2643,10 @@ async def handle_callback(client: Client, callback_query):
             chat_id = int(chat_id_raw)
             message_id = int(message_id_raw)
             msg_info = get_message_context(chat_id, message_id)
-            if not msg_info:
-                return await callback_query.message.reply_text("❌ انتهت بيانات هذه الرسالة أو لم تعد موجودة.")
+            if not msg_info or not msg_info.get("is_reply", False):
+                return await callback_query.message.reply_text(
+                    "❌ هذه الرسالة ليست ردًّا محفوظًا على رسائل حساباتك."
+                )
 
             account_number = msg_info.get("from_account")
             account_label = f"الحساب رقم {account_number}" if account_number else "غير محدد"
@@ -2666,8 +2739,6 @@ async def handle_callback(client: Client, callback_query):
         except (IndexError, ValueError):
             return await callback_query.message.reply_text("❌ الحساب غير موجود.")
 
-        # زر الحساب يحمل profile_id حتى لا يُحذف حساب من المجموعة الخطأ
-        # إذا تغيّر الملف النشط أو وصلت callback في مهمة مختلفة.
         profile_id = "_".join(parts[3:]) if len(parts) > 3 else current_profile_id()
         profile = next(
             (
@@ -2692,8 +2763,6 @@ async def handle_callback(client: Client, callback_query):
             account_number = index + 1
             session_str = accounts[index]
 
-            # إيقاف مراقبات الحسابات أولًا حتى لا تبقى جلسة الحساب المحذوف
-            # فعالة بعد إزالة الـ Session String من التخزين.
             if had_userbot_tasks:
                 await stop_all_userbots(profile_id)
 
@@ -2705,6 +2774,7 @@ async def handle_callback(client: Client, callback_query):
                 "account_group_posts",
                 "account_group_incoming",
                 "account_group_last_sent",
+                "account_group_waits",
             ):
                 profile_data[key] = remove_indexed_account_state(
                     profile_data.get(key, {}),
@@ -2719,7 +2789,6 @@ async def handle_callback(client: Client, callback_query):
             profile["data"] = profile_data
             save_data(profile_data)
 
-            # لا نرسل رسالة نجاح إلا بعد التأكد من أن الحساب لم يعد محفوظًا.
             persisted_profile = next(
                 (
                     item
@@ -2737,7 +2806,6 @@ async def handle_callback(client: Client, callback_query):
             get_account_cache().clear()
             get_account_status_cache().clear()
 
-            # تسجيل الخروج من Telegram اختياري؛ فشلُه لا يعيد الحساب إلى التخزين.
             temp_client = None
             try:
                 temp_client = Client(
@@ -2756,6 +2824,7 @@ async def handle_callback(client: Client, callback_query):
                         await temp_client.stop()
                     except Exception:
                         pass
+                _cleanup_session_file(f"logout_session_{profile_id}_{index}")
 
             if had_userbot_tasks and profile_data.get("accounts"):
                 await start_all_userbots()
@@ -2778,7 +2847,7 @@ async def handle_callback(client: Client, callback_query):
         finally:
             profile_context.reset(token)
 
-# --- /start command ---
+
 @app.on_message(
     filters.private & filters.incoming & filters.command("start"),
     group=-1,
@@ -2794,7 +2863,7 @@ async def start_cmd(client: Client, message: Message):
     save_data(db)
     await show_profile_menu(message)
 
-# --- Toggle auto join ---
+
 @app.on_message(filters.private & filters.user(OWNER_ID) & filters.command("toggle_auto_join"))
 async def toggle_auto_join(client: Client, message: Message):
     db["auto_join_groups"] = not db.get("auto_join_groups", True)
@@ -2802,42 +2871,48 @@ async def toggle_auto_join(client: Client, message: Message):
     status = "مفعل" if db["auto_join_groups"] else "معطل"
     await message.reply_text(f"✅ الانضمام التلقائي للكروبات الآن: {status}")
 
+
 # --- Main execution ---
 if __name__ == "__main__":
     print("🤖 Bot running with advanced features...")
     print(f"👤 Owner: {OWNER_ID}")
     print(f"📊 Data: {DATA_FILE}")
+    print(f"📡 Max joined channels per account: {MAX_JOINED_CHANNELS_PER_ACCOUNT}")
+    print(f"⏰ Max channel age: {MAX_CHANNEL_AGE_HOURS}h")
     print("✨ Features:")
     print("  🔄 Sequential posting system")
-    print("  🎯 Template rotation (1, 2, 3...)")
+    print("  🎯 Template rotation (random)")
     print("  🔄 Group rotation for each account")
     print("  📡 Auto-join channels from ANY bot message (Userbots)")
-    print("  ⏰ Auto-leave after 24 hours")
+    print("  🚪 Auto-leave after 24h OR oldest-first when full")
     print("  👥 Reply forwarding to owner")
     print("  💬 Owner reply system")
     print("  📱 Private message handling")
     print("  🛡️ Account ban/freeze monitoring")
-    
+
     async def startup_tasks():
-        # تشغيل كل ملفات التشغيل بالتوازي بعد إعادة تشغيل الخدمة
         for profile in profile_store.get("profiles", []):
             profile_id = profile.get("id")
             token = profile_context.set(profile_id)
             try:
-                # بعد إعادة تشغيل الخدمة، أعد فحص القنوات الإجبارية قبل استئناف النشر.
                 if db.get("accounts"):
                     await join_all_accounts_to_configured_groups()
                 await start_all_userbots()
+                if db.get("joined_channels"):
+                    ensure_auto_leave_task(profile_id)
                 if db.get("is_running") and db.get("accounts") and db.get("templates") and db.get("groups"):
-                    profile_posting_tasks[profile_id] = asyncio.create_task(auto_posting_loop())
+                    profile_posting_tasks[profile_id] = asyncio.create_task(auto_posting_loop(profile_id))
                     print(f"🔄 Posting loop resumed for {profile_id}")
+                else:
+                    # تنظيف راية قديمة إن وُجدت بدون مهمة فعلية
+                    if db.get("is_running"):
+                        db["is_running"] = False
+                        save_data()
             finally:
                 profile_context.reset(token)
 
-    # تشغيل userbots واستئناف حلقة النشر قبل تشغيل البوت الرئيسي
     asyncio.get_event_loop().run_until_complete(startup_tasks())
 
-    # تشغيل البوت الرئيسي مع تسجيل هوية البوت المتصل بدل app.run() الصامت.
     async def run_main_bot():
         try:
             await app.start()
