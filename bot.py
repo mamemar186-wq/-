@@ -598,7 +598,6 @@ def clean_group_link(link):
     link = re.sub(r"(?i)^https?://telegram\.me/", "https://t.me/", link)
     link = re.sub(r"(?i)^telegram\.me/", "t.me/", link)
     link = re.sub(r"(?i)^tg://join\?invite=([\w-]+)$", r"https://t.me/+\1", link)
-    # رابط t.me/c/<id> لا يُحوَّل لأيدي رقمي؛ يُحل داخل جلسة الحساب عبر get_chat
     if re.match(r"^(?:https?://)?t\.me/c/\d+", link, flags=re.IGNORECASE):
         return link.rstrip("/")
     link = re.sub(r"[?#].*$", "", link)
@@ -827,8 +826,7 @@ async def get_group_dialog_states(client):
 
         missing_groups = [
             g for g in db.get("groups", [])
-            if g not in states
-        ]
+            if g not in states        ]
         for configured_group in missing_groups:
             latest_time = None
             try:
@@ -1209,43 +1207,63 @@ async def join_channel_for_account(session_str, account_index, channel):
             session_string=session_str,
         )
         await user_app.start()
-        chat_info = None
+        
+        # --- إصلاح جذري: التقاط حظر الانضمام والنوم للمدة المطلوبة ---
         try:
-            chat_info = await user_app.get_chat(clean_link)
-        except Exception:
-            chat_info = await get_chat_from_private_invite(user_app, clean_link)
-        if chat_info and getattr(chat_info, "id", None) is not None:
-            db.setdefault("group_chat_ids", {})[clean_link] = str(chat_info.id)
-            save_data(db) # <--- تحديث هام: حفظ المعرف فوراً
-
-        try:
-            joined_chat = await user_app.join_chat(clean_link)
-            joined = True
-            print(f"✅ Acc {account_index + 1} joined {clean_link}")
-            if getattr(joined_chat, "id", None) is not None:
-                db.setdefault("group_chat_ids", {})[clean_link] = str(joined_chat.id)
-                save_data(db) # <--- تحديث هام: حفظ المعرف فوراً
-        except Exception as error:
-            error_text = str(error).upper()
-            if "ALREADY_PARTICIPANT" in error_text or "USER_ALREADY_PARTICIPANT" in error_text:
-                joined = True
-                print(f"✅ Acc {account_index + 1} is already in {clean_link}")
-            else:
-                record_failure(account_index + 1, clean_link, error)
-                print(f"❌ Acc {account_index + 1} failed to join {clean_link}: {error}")
-        if joined:
-            account_joined_channels.setdefault(account_key, {})[clean_link] = True
-        if clean_link not in db.get("group_chat_ids", {}):
+            chat_info = None
             try:
+                chat_info = await user_app.get_chat(clean_link)
+            except FloodWait as e:
+                wait_time = e.value if hasattr(e, 'value') else e.x
+                print(f"⏳ Acc {account_index + 1} FloodWait {wait_time}s during get_chat. Sleeping...")
+                await asyncio.sleep(wait_time + 2)
                 chat_info = await user_app.get_chat(clean_link)
             except Exception:
                 chat_info = await get_chat_from_private_invite(user_app, clean_link)
+
             if chat_info and getattr(chat_info, "id", None) is not None:
                 db.setdefault("group_chat_ids", {})[clean_link] = str(chat_info.id)
                 save_data(db)
-    except Exception as error:
-        record_failure(account_index + 1, clean_link, error)
-        print(f"❌ Error opening acc {account_index + 1} for {clean_link}: {error}")
+
+            try:
+                joined_chat = await user_app.join_chat(clean_link)
+                joined = True
+                print(f"✅ Acc {account_index + 1} joined {clean_link}")
+                if getattr(joined_chat, "id", None) is not None:
+                    db.setdefault("group_chat_ids", {})[clean_link] = str(joined_chat.id)
+                    save_data(db)
+            except FloodWait as e:
+                wait_time = e.value if hasattr(e, 'value') else e.x
+                print(f"⏳ Acc {account_index + 1} FloodWait {wait_time}s during join. Sleeping...")
+                await asyncio.sleep(wait_time + 2)
+                # لا نعيد المحاولة فوراً، بل نتركها للدورة القادمة
+                record_failure(account_index + 1, clean_link, f"FLOOD_WAIT_X {wait_time}", reason="تيليجرام طلب الانتظار أثناء الانضمام.", solution="البوت سينتظر تلقائياً ويعيد المحاولة.")
+            except Exception as error:
+                error_text = str(error).upper()
+                if "ALREADY_PARTICIPANT" in error_text or "USER_ALREADY_PARTICIPANT" in error_text:
+                    joined = True
+                    print(f"✅ Acc {account_index + 1} is already in {clean_link}")
+                else:
+                    record_failure(account_index + 1, clean_link, error)
+                    print(f"❌ Acc {account_index + 1} failed to join {clean_link}: {error}")
+
+            if joined:
+                account_joined_channels.setdefault(account_key, {})[clean_link] = True
+            if clean_link not in db.get("group_chat_ids", {}):
+                try:
+                    chat_info = await user_app.get_chat(clean_link)
+                except Exception:
+                    chat_info = await get_chat_from_private_invite(user_app, clean_link)
+                if chat_info and getattr(chat_info, "id", None) is not None:
+                    db.setdefault("group_chat_ids", {})[clean_link] = str(chat_info.id)
+                    save_data(db)
+                    
+        except Exception as error:
+            record_failure(account_index + 1, clean_link, error)
+            print(f"❌ Error opening acc {account_index + 1} for {clean_link}: {error}")
+            
+    except Exception as e:
+        print(f"❌ General error in join for {clean_link}: {e}")
     finally:
         if user_app:
             try:
