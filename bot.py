@@ -693,6 +693,7 @@ async def get_account_group_target(client, group):
     resolved_id = getattr(chat_info, "id", None) if chat_info else None
     if resolved_id is not None:
         db.setdefault("group_chat_ids", {})[clean_group] = str(resolved_id)
+        save_data(db)
         return int(resolved_id)
 
     db.setdefault("group_chat_ids", {}).pop(clean_group, None)
@@ -1215,6 +1216,7 @@ async def join_channel_for_account(session_str, account_index, channel):
             chat_info = await get_chat_from_private_invite(user_app, clean_link)
         if chat_info and getattr(chat_info, "id", None) is not None:
             db.setdefault("group_chat_ids", {})[clean_link] = str(chat_info.id)
+            save_data(db) # <--- تحديث هام: حفظ المعرف فوراً
 
         try:
             joined_chat = await user_app.join_chat(clean_link)
@@ -1222,6 +1224,7 @@ async def join_channel_for_account(session_str, account_index, channel):
             print(f"✅ Acc {account_index + 1} joined {clean_link}")
             if getattr(joined_chat, "id", None) is not None:
                 db.setdefault("group_chat_ids", {})[clean_link] = str(joined_chat.id)
+                save_data(db) # <--- تحديث هام: حفظ المعرف فوراً
         except Exception as error:
             error_text = str(error).upper()
             if "ALREADY_PARTICIPANT" in error_text or "USER_ALREADY_PARTICIPANT" in error_text:
@@ -1239,6 +1242,7 @@ async def join_channel_for_account(session_str, account_index, channel):
                 chat_info = await get_chat_from_private_invite(user_app, clean_link)
             if chat_info and getattr(chat_info, "id", None) is not None:
                 db.setdefault("group_chat_ids", {})[clean_link] = str(chat_info.id)
+                save_data(db)
     except Exception as error:
         record_failure(account_index + 1, clean_link, error)
         print(f"❌ Error opening acc {account_index + 1} for {clean_link}: {error}")
@@ -1366,6 +1370,11 @@ async def ensure_account_in_group(client, group, account_number):
                 status = getattr(member, "status", "")
                 status = getattr(status, "value", status)
                 if str(status).lower() not in ("left", "kicked", "banned"):
+                    # فحص صلاحية الكتابة
+                    if hasattr(member, 'privileges') and member.privileges:
+                        if not member.privileges.can_send_messages:
+                            print(f"⚠️ Acc {account_number} cannot write to {clean_link} (no permission)")
+                            return False, True # خطأ دائم
                     mark_member(resolved_id)
                     return True, False
         except FloodWait as error:
@@ -1374,12 +1383,16 @@ async def ensure_account_in_group(client, group, account_number):
         except Exception:
             pass
 
-    chat_target = clean_group
+    chat_target = clean_group_link(group) or str(group)
     try:
         member = await client.get_chat_member(chat_target, "me")
         status = getattr(member, "status", "")
         status = getattr(status, "value", status)
         if str(status).lower() not in ("left", "kicked", "banned"):
+            if hasattr(member, 'privileges') and member.privileges:
+                if not member.privileges.can_send_messages:
+                    print(f"⚠️ Acc {account_number} cannot write to {clean_link} (no permission)")
+                    return False, True # خطأ دائم
             mark_member(getattr(member, "chat", None) and getattr(member.chat, "id", None))
             return True, False
     except FloodWait as error:
@@ -1397,6 +1410,10 @@ async def ensure_account_in_group(client, group, account_number):
             status = getattr(member, "status", "")
             status = getattr(status, "value", status)
             if str(status).lower() not in ("left", "kicked", "banned"):
+                if hasattr(member, 'privileges') and member.privileges:
+                    if not member.privileges.can_send_messages:
+                        print(f"⚠️ Acc {account_number} cannot write to {clean_link} (no permission)")
+                        return False, True # خطأ دائم
                 mark_member(resolved_id)
                 return True, False
     except FloodWait as error:
@@ -1494,6 +1511,8 @@ async def auto_posting_loop(profile_id=None):
         account_send_locks = {info["number"]: asyncio.Lock() for info in valid_accounts}
 
         async def post_to_group(acc_info, group):
+            # --- إصلاح 1: تعريف clean_group ---
+            clean_group = clean_group_link(group) 
             if not db["is_running"]:
                 return
             client = acc_info["client"]
@@ -1592,6 +1611,8 @@ async def auto_posting_loop(profile_id=None):
             rotation_index = int(db.get("account_rotation_index", 0) or 0) % len(valid_accounts)
             for group_index, group in enumerate(groups_this_round):
                 acc_info = valid_accounts[(group_index + rotation_index) % len(valid_accounts)]
+                # --- إصلاح 2: إضافة تأخير بسيط بين الحسابات لتفادي FLOOD_WAIT المتزامن ---
+                await asyncio.sleep(2) 
                 group_tasks.append(asyncio.create_task(post_to_group(acc_info, group)))
 
             results = await asyncio.gather(*group_tasks, return_exceptions=True)
