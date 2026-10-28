@@ -60,14 +60,12 @@ profile_account_statuses = {}
 forwarded_incoming = set()
 group_message_keys = set()
 
-# حد أقصى للقنوات الإجبارية قبل مغادرة الأقدم
 MAX_JOINED_CHANNELS_PER_ACCOUNT = 400
 MAX_CHANNEL_AGE_HOURS = 24
 GROUP_RETRY_MINUTES = 15
 
 # --- Load/Save Data ---
 def default_profile_data():
-    """البيانات الافتراضية لبوت واحد، بدون أي حسابات أو معلومات مستخدم."""
     return {
         "accounts": [],
         "templates": [],
@@ -100,7 +98,6 @@ def default_profile_data():
 
 
 def ensure_profile_data(data):
-    """ترحيل البيانات القديمة وإضافة أي مفاتيح جديدة دون فقدان شيء."""
     defaults = default_profile_data()
     for key, value in defaults.items():
         if key not in data:
@@ -134,7 +131,6 @@ def current_profile_record():
 
 
 class ProfileDBProxy:
-    """يوجه كل مهمة asyncio إلى بيانات ملف التشغيل الخاص بها."""
     def _data(self):
         return current_profile_record()["data"]
 
@@ -288,7 +284,6 @@ def save_data(data=None):
 
 
 def _cleanup_session_file(name):
-    """حذف ملف .session اليتيم إن وُجد."""
     path = f"{name}.session"
     try:
         if os.path.exists(path):
@@ -618,7 +613,6 @@ def clean_group_link(link):
 
 
 def get_group_chat_target(group):
-    """إرجاع معرّف الدردشة الحقيقي بدل رابط الدعوة عند توفره."""
     clean_group = clean_group_link(group)
     known_chat_id = db.get("group_chat_ids", {}).get(clean_group)
     if known_chat_id is not None:
@@ -642,12 +636,10 @@ def is_private_invite_link(value):
 
 
 def is_private_channel_link(value):
-    """رابط قناة/كروب خاص بصيغة t.me/c/<id>."""
     return bool(re.match(r"^(?:https?://)?t\.me/c/\d+", str(value or ""), flags=re.IGNORECASE))
 
 
 async def get_account_group_target(client, group):
-    """حل هدف الدردشة داخل جلسة الحساب الحالية فقط."""
     clean_group = clean_group_link(group)
     if not clean_group:
         return clean_group
@@ -701,7 +693,6 @@ async def get_account_group_target(client, group):
 
 
 async def get_chat_from_private_invite(client, invite_link):
-    """استخراج الدردشة من رابط دعوة خاص حتى عند كون الحساب عضوًا مسبقًا."""
     if CheckChatInvite is None:
         return None
     match = re.fullmatch(
@@ -726,7 +717,6 @@ async def get_chat_from_private_invite(client, invite_link):
 
 
 def get_account_group_blocks(account_number):
-    """إرجاع حالات التجميد المؤقتة مع ترحيل الصيغة القديمة."""
     all_blocks = db.setdefault("account_blocked_groups", {})
     key = str(account_number)
     blocks = all_blocks.setdefault(key, {})
@@ -760,7 +750,6 @@ def get_account_group_post_state(account_number, group):
 
 
 def can_account_post_to_group(account_number, group, latest_time=None):
-    """السماح بالنشر عند وجود نشاط أحدث من آخر نشر للحساب."""
     post_count, _ = get_account_group_post_state(account_number, group)
     if post_count == 0:
         return True
@@ -791,7 +780,6 @@ def mark_account_group_sent(account_number, group):
 
 
 async def get_group_dialog_states(client):
-    """قراءة آخر رسالة وعدد الرسائل غير المقروءة من جلسة الحساب الحالية."""
     states = {}
     try:
         known_chat_ids = db.setdefault("group_chat_ids", {})
@@ -858,7 +846,6 @@ async def get_group_dialog_states(client):
 
 
 def get_next_group(account_number=None):
-    """اختيار الكروب التالي بالتناوب دون شروط نشاط أو رسائل غير مقروءة."""
     groups = db.get("groups", [])
     if not groups:
         return None
@@ -1052,10 +1039,16 @@ async def check_account_status(client, account_number):
 
 
 async def notify_owner(message):
-    try:
-        await app.send_message(OWNER_ID, f"⚠️ تنبيه البوت:\n{message}")
-    except Exception as error:
-        print(f"⚠️ فشل إرسال إشعار للمالك: {message} | السبب: {error}")
+    """دالة موحدة لإرسال الإشعارات، مع محاولة إعادة الإرسال إذا كان البوت غير متصل."""
+    for attempt in range(3):
+        try:
+            if app.is_connected:
+                await app.send_message(OWNER_ID, f"⚠️ تنبيه البوت:\n{message}")
+                return
+        except Exception as error:
+            print(f"⚠️ فشل إرسال إشعار للمالك (محاولة {attempt+1}): {message} | السبب: {error}")
+            await asyncio.sleep(2)
+    print(f"❌ لم يتم إرسال الإشعار للمالك بعد 3 محاولات: {message}")
 
 
 # --- المغادرة التلقائية (بعد 24 ساعة + الأقدم عند الامتلاء) ---
@@ -1100,7 +1093,6 @@ def _oldest_channels(limit):
 
 
 async def auto_leave_channels(profile_id=None):
-    """مغادرة القنوات التي تجاوزت 24 ساعة أو الأقدم عند امتلاء الحساب."""
     token = None
     if profile_id and profile_id != current_profile_id():
         token = profile_context.set(profile_id)
@@ -1163,7 +1155,6 @@ auto_leave_tasks = {}
 
 
 def ensure_auto_leave_task(profile_id=None):
-    """تشغيل مهمة مغادرة واحدة لكل profile إذا لم تكن تعمل."""
     profile_id = profile_id or current_profile_id()
     task = auto_leave_tasks.get(profile_id)
     if task and not task.done():
@@ -1235,8 +1226,8 @@ async def join_channel_for_account(session_str, account_index, channel):
             except FloodWait as e:
                 wait_time = e.value if hasattr(e, 'value') else e.x
                 print(f"⏳ Acc {account_index + 1} FloodWait {wait_time}s during join. Sleeping...")
+                await notify_owner(f"⏳ الحساب {account_index + 1} وصل إلى حد الحظر (FloodWait). سينتظر {wait_time} ثانية قبل المحاولة مجدداً في الكروب: {clean_link}")
                 await asyncio.sleep(wait_time + 2)
-                # لا نعيد المحاولة فوراً، بل نتركها للدورة القادمة
                 record_failure(account_index + 1, clean_link, f"FLOOD_WAIT_X {wait_time}", reason="تيليجرام طلب الانتظار أثناء الانضمام.", solution="البوت سينتظر تلقائياً ويعيد المحاولة.")
             except Exception as error:
                 error_text = str(error).upper()
@@ -1244,6 +1235,8 @@ async def join_channel_for_account(session_str, account_index, channel):
                     joined = True
                     print(f"✅ Acc {account_index + 1} is already in {clean_link}")
                 else:
+                    # إرسال إشعار للمالك عند فشل الانضمام لأي سبب آخر
+                    await notify_owner(f"❌ فشل الحساب {account_index + 1} في الانضمام إلى {clean_link}.\n🔎 السبب: {str(error)[:200]}")
                     record_failure(account_index + 1, clean_link, error)
                     print(f"❌ Acc {account_index + 1} failed to join {clean_link}: {error}")
 
@@ -1259,10 +1252,12 @@ async def join_channel_for_account(session_str, account_index, channel):
                     save_data(db)
                     
         except Exception as error:
+            await notify_owner(f"❌ خطأ غير متوقع أثناء معالجة الكروب {clean_link} للحساب {account_index + 1}:\n{str(error)[:200]}")
             record_failure(account_index + 1, clean_link, error)
             print(f"❌ Error opening acc {account_index + 1} for {clean_link}: {error}")
             
     except Exception as e:
+        await notify_owner(f"❌ خطأ في فتح جلسة الحساب {account_index + 1} للكروب {clean_link}:\n{str(e)[:200]}")
         print(f"❌ General error in join for {clean_link}: {e}")
     finally:
         if user_app:
@@ -1341,7 +1336,6 @@ async def join_channel_for_all_accounts(channel, track_for_auto_leave=True):
         join_time = datetime.now().isoformat()
         db["joined_channels"][clean_link] = join_time
         db["channel_join_time"][clean_link] = join_time
-        # بعد إضافة قناة جديدة، إن تجاوزنا الحد الأقصى، شغّل المغادرة فورًا
         if len(db.get("joined_channels", {})) > MAX_JOINED_CHANNELS_PER_ACCOUNT:
             ensure_auto_leave_task()
         save_data(db)
@@ -1352,7 +1346,6 @@ async def join_channel_for_all_accounts(channel, track_for_auto_leave=True):
 
 # --- MAIN POSTING LOOP ---
 async def ensure_account_in_group(client, group, account_number):
-    """التأكد من العضوية قبل الإرسال مع احترام FLOOD_WAIT لكل حساب وكروب."""
     clean_link = clean_group_link(group) or str(group)
     account_key = str(account_number - 1)
     wait_key = f"{account_key}:{clean_link}"
@@ -1388,11 +1381,11 @@ async def ensure_account_in_group(client, group, account_number):
                 status = getattr(member, "status", "")
                 status = getattr(status, "value", status)
                 if str(status).lower() not in ("left", "kicked", "banned"):
-                    # فحص صلاحية الكتابة
                     if hasattr(member, 'privileges') and member.privileges:
                         if not member.privileges.can_send_messages:
                             print(f"⚠️ Acc {account_number} cannot write to {clean_link} (no permission)")
-                            return False, True # خطأ دائم
+                            await notify_owner(f"⚠️ الحساب {account_number} لا يملك صلاحية الكتابة في {clean_link}. تم تجميده مؤقتاً.")
+                            return False, True
                     mark_member(resolved_id)
                     return True, False
         except FloodWait as error:
@@ -1410,7 +1403,8 @@ async def ensure_account_in_group(client, group, account_number):
             if hasattr(member, 'privileges') and member.privileges:
                 if not member.privileges.can_send_messages:
                     print(f"⚠️ Acc {account_number} cannot write to {clean_link} (no permission)")
-                    return False, True # خطأ دائم
+                    await notify_owner(f"⚠️ الحساب {account_number} لا يملك صلاحية الكتابة في {clean_link}. تم تجميده مؤقتاً.")
+                    return False, True
             mark_member(getattr(member, "chat", None) and getattr(member.chat, "id", None))
             return True, False
     except FloodWait as error:
@@ -1431,7 +1425,8 @@ async def ensure_account_in_group(client, group, account_number):
                 if hasattr(member, 'privileges') and member.privileges:
                     if not member.privileges.can_send_messages:
                         print(f"⚠️ Acc {account_number} cannot write to {clean_link} (no permission)")
-                        return False, True # خطأ دائم
+                        await notify_owner(f"⚠️ الحساب {account_number} لا يملك صلاحية الكتابة في {clean_link}. تم تجميده مؤقتاً.")
+                        return False, True
                 mark_member(resolved_id)
                 return True, False
     except FloodWait as error:
@@ -1473,7 +1468,6 @@ async def ensure_account_in_group(client, group, account_number):
 
 
 async def auto_posting_loop(profile_id=None):
-    """حلقة نشر مستقلة لكل profile، لا تعتمد على ContextVar الخارجي."""
     token = None
     if profile_id and profile_id != current_profile_id():
         token = profile_context.set(profile_id)
@@ -1529,7 +1523,6 @@ async def auto_posting_loop(profile_id=None):
         account_send_locks = {info["number"]: asyncio.Lock() for info in valid_accounts}
 
         async def post_to_group(acc_info, group):
-            # --- إصلاح 1: تعريف clean_group ---
             clean_group = clean_group_link(group) 
             if not db["is_running"]:
                 return
@@ -1616,6 +1609,7 @@ async def auto_posting_loop(profile_id=None):
                 consecutive_errors[acc_number] += 1
                 advance_group_after_attempt(group)
                 if is_permanent_group_error(error_text):
+                    await notify_owner(f"❌ فشل الإرسال للحساب {acc_number} في {group}:\n{error_text[:200]}")
                     block_account_from_group(acc_number, group)
 
         while db["is_running"]:
@@ -1629,7 +1623,6 @@ async def auto_posting_loop(profile_id=None):
             rotation_index = int(db.get("account_rotation_index", 0) or 0) % len(valid_accounts)
             for group_index, group in enumerate(groups_this_round):
                 acc_info = valid_accounts[(group_index + rotation_index) % len(valid_accounts)]
-                # --- إصلاح 2: إضافة تأخير بسيط بين الحسابات لتفادي FLOOD_WAIT المتزامن ---
                 await asyncio.sleep(2) 
                 group_tasks.append(asyncio.create_task(post_to_group(acc_info, group)))
 
@@ -2339,7 +2332,6 @@ async def handle_owner_commands(client: Client, message: Message):
             profile_id = current_profile_id()
             posting_task = profile_posting_tasks.get(profile_id)
 
-            # حالة غير متناسقة: is_running محفوظ لكن لا توجد مهمة فعلية
             if db["is_running"] and (posting_task is None or posting_task.done()):
                 print(f"⚠️ Stale is_running for {profile_id}; resetting")
                 db["is_running"] = False
@@ -2352,7 +2344,6 @@ async def handle_owner_commands(client: Client, message: Message):
             if not db["accounts"] or not db["templates"] or not db["groups"]:
                 return await message.reply_text("❌ يجب إضافة حساب وكليشة وكروب أولًا.")
 
-            # تنظيف أي بقايا من تشغيل سابق
             await stop_all_userbots(profile_id)
             await stop_auto_leave_task(profile_id)
 
@@ -2376,8 +2367,7 @@ async def handle_owner_commands(client: Client, message: Message):
                         f"الحساب {item['account']}: {item['joined']}/{item['total']} كروب"
                         for item in join_results
                     ) if join_results else "لا توجد كروبات مسجلة."
-                    await app.send_message(
-                        OWNER_ID,
+                    await notify_owner(
                         f"🚀 تم تشغيل البوت!\n"
                         f"⏱ المؤقت: {timer_value} ثانية\n"
                         f"📊 الحسابات: {len(db['accounts'])}\n"
@@ -2943,7 +2933,6 @@ if __name__ == "__main__":
                     profile_posting_tasks[profile_id] = asyncio.create_task(auto_posting_loop(profile_id))
                     print(f"🔄 Posting loop resumed for {profile_id}")
                 else:
-                    # تنظيف راية قديمة إن وُجدت بدون مهمة فعلية
                     if db.get("is_running"):
                         db["is_running"] = False
                         save_data()
