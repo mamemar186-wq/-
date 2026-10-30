@@ -549,6 +549,19 @@ def get_menu_action(text):
     return None
 
 
+# --- دالة مساعدة للتحقق مما إذا كان الرابط يعود لبوت ---
+def is_bot_username(value):
+    """يتحقق مما إذا كان المعرف أو الرابط ينتمي إلى بوت (ينتهي بـ bot)"""
+    val = str(value or "").strip().lower()
+    if val.startswith("@"):
+        return val.endswith("bot")
+    if "t.me/" in val:
+        # استخراج اسم المستخدم من الرابط
+        username = val.split("t.me/")[-1].split("/")[0]
+        return username.endswith("bot")
+    return False
+
+
 # --- دالة استخراج الروابط (مع تجاهل روابط الأعضاء) ---
 def extract_all_links(message: Message):
     """Extract channel links ONLY from bot-generated messages.
@@ -575,6 +588,11 @@ def extract_all_links(message: Message):
         )
         for match in re.finditer(pattern, value, flags=re.IGNORECASE):
             candidate = match.group(0).rstrip(".,;:!?)]}")
+            
+            # تجاهل البوتات تماماً
+            if is_bot_username(candidate):
+                continue
+                
             if candidate not in seen:
                 links.append(candidate)
                 seen.add(candidate)
@@ -1192,6 +1210,11 @@ async def join_channel_for_account(session_str, account_index, channel):
     if not clean_link:
         return False
 
+    # تجاهل البوتات تماماً
+    if is_bot_username(clean_link):
+        print(f"⚠️ Skipping bot username: {clean_link}")
+        return False
+
     account_key = str(account_index)
     account_joined_channels = db.setdefault("account_joined_channels", {})
     already_confirmed = account_joined_channels.get(account_key, {}).get(clean_link) is True
@@ -1283,9 +1306,16 @@ async def join_account_to_configured_groups(session_str, account_index):
     joined_count = 0
 
     for channel in mandatory_channels:
+        if is_bot_username(channel):
+            continue
         await join_channel_for_account(session_str, account_index, channel)
 
     for group in groups:
+        # تجاهل البوتات إذا كانت مضافة بالخطأ في الكروبات
+        if is_bot_username(group):
+            print(f"⚠️ Skipping bot from configured groups: {group}")
+            continue
+            
         if await join_channel_for_account(session_str, account_index, group):
             joined_count += 1
         await asyncio.sleep(1)
@@ -1331,6 +1361,11 @@ async def join_channel_for_all_accounts(channel, track_for_auto_leave=True):
     clean_link = clean_group_link(channel)
     if not clean_link:
         return
+        
+    # تجاهل البوتات تماماً
+    if is_bot_username(clean_link):
+        return
+
     if track_for_auto_leave and clean_link in db.get("joined_channels", {}):
         print(f"🔁 Rechecking mandatory channel {clean_link} for every account")
 
