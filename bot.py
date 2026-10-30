@@ -1504,14 +1504,13 @@ async def get_last_user_message_in_group(client, chat_id):
     return None
 
 
-async def post_to_group(client, acc_number, group, timer_value, account_send_locks, consecutive_errors, max_errors):
-    """Send a message to a group. If reply_enabled, reply to the last user message."""
+async def post_to_group(client, acc_number, group, account_send_locks, consecutive_errors, max_errors):
+    """Send a single message to one group. The timing between sends is
+    managed by auto_posting_loop (strict sequential timing)."""
     clean_group = clean_group_link(group)
     if not db["is_running"]:
         return
     try:
-        delay = random.uniform(max(1, timer_value * 0.7), timer_value * 1.3)
-        await asyncio.sleep(delay)
         template = get_next_template()
         if template is None:
             return
@@ -1533,9 +1532,8 @@ async def post_to_group(client, acc_number, group, timer_value, account_send_loc
 
             status = await check_account_status(client, acc_number)
             if status["status"] == "flood":
-                wait_time = status.get("wait", timer_value)
-                print(f"⏳ Acc {acc_number} flood wait {wait_time}s on {group}")
-                await asyncio.sleep(wait_time)
+                # Skip this send without blocking the sequential loop
+                print(f"⏳ Acc {acc_number} flood-skipped on {group} (won't block loop)")
                 return
             if status["status"] != "active":
                 db["stats"]["failed_count"] += 1
@@ -1588,10 +1586,9 @@ async def post_to_group(client, acc_number, group, timer_value, account_send_loc
         db["stats"]["failed_count"] += 1
         record_failure(acc_number, group, f"FLOOD_WAIT: {e.value}s")
         save_data(db)
-        error_msg = f"⏳ Acc {acc_number} flood wait {e.value}s on {group}"
-        print(f"⚠️ {error_msg}")
-        await notify_owner(error_msg)
-        await asyncio.sleep(e.value)
+        print(f"⚠️ Acc {acc_number} flood {e.value}s on {group} — skipped (non-blocking)")
+        # NOTE: we intentionally do NOT await asyncio.sleep(e.value) here,
+        # because that would freeze the sequential timer loop for ALL accounts.
     except UserBannedInChannel:
         db["stats"]["failed_count"] += 1
         record_failure(acc_number, group, "USER_BANNED_IN_CHANNEL")
@@ -1661,12 +1658,26 @@ async def auto_posting_loop(profile_id=None):
             save_data(db)
             return
 
-        print(f"🚀 Starting with {len(valid_accounts)} active accounts, interval: {timer_value}s")
-        await notify_owner(f"🚀 بدء تشغيل البوت\n📊 {len(valid_accounts)} حساب نشط\n⏱ الفاصل: {timer_value} ثانية\n💬 الرد التلقائي: {'مفعل' if db.get('reply_enabled', True) else 'معطل'}")
+        print(
+            f"🚀 Starting with {len(valid_accounts)} active accounts, "
+            f"sequential interval: {timer_value}s (start-to-start)"
+        )
+        await notify_owner(
+            f"🚀 بدء تشغيل البوت\n"
+            f"📊 {len(valid_accounts)} حساب نشط\n"
+            f"⏱ الفاصل بين الحسابات: {timer_value} ثانية (تسلسلي)\n"
+            f"💬 الرد التلقائي: {'مفعل' if db.get('reply_enabled', True) else 'معطل'}"
+        )
 
         consecutive_errors = {info["number"]: 0 for info in valid_accounts}
         max_errors = 5
         account_send_locks = {info["number"]: asyncio.Lock() for info in valid_accounts}
+
+        # last_send_start == None means: this is the very first send of the
+        # session, so wait timer_value seconds before doing it (strict rule:
+        # acc1 after timer, acc2 after timer more, ...).
+        last_send_start = None
+        print(f"⏱ أول إرسال سيكون بعد {timer_value} ثانية من الآن")
 
         while db["is_running"]:
             if not db["accounts"] or not db["templates"] or not db["groups"]:
@@ -1674,28 +1685,52 @@ async def auto_posting_loop(profile_id=None):
                 save_data(db)
                 break
 
+            # Re-read timer each round so live changes by owner apply immediately.
+            timer_value = max(1, int(db.get("timer", 60)))
+
             groups_this_round = list(db.get("groups", []))
-            group_tasks = []
             rotation_index = int(db.get("account_rotation_index", 0) or 0) % len(valid_accounts)
+
             for group_index, group in enumerate(groups_this_round):
+                if not db["is_running"]:
+                    break
+
+                # ===== TIMING GATE: strict start-to-start spacing of timer_value =====
+                if last_send_start is None:
+                    # First send after bot start: full timer_value wait
+                    await asyncio.sleep(timer_value)
+                else:
+                    elapsed = (datetime.now() - last_send_start).total_seconds()
+                    remaining = timer_value - elapsed
+                    if remaining > 0:
+                        # Tiny jitter (3%) to avoid a rigid pattern
+                        await asyncio.sleep(remaining * random.uniform(0.97, 1.03))
+
+                if not db["is_running"]:
+                    break
+
                 acc_info = valid_accounts[(group_index + rotation_index) % len(valid_accounts)]
-                group_tasks.append(asyncio.create_task(
-                    post_to_group(
+                send_start = datetime.now()
+                print(
+                    f"📤 [{send_start.strftime('%H:%M:%S')}] "
+                    f"Acc {acc_info['number']} → {group} (next in ~{timer_value}s)"
+                )
+                try:
+                    await post_to_group(
                         acc_info["client"],
                         acc_info["number"],
                         group,
-                        timer_value,
                         account_send_locks,
                         consecutive_errors,
                         max_errors,
                     )
-                ))
-                await asyncio.sleep(2)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    print(f"❌ خطأ غير معالج في كروب {group}: {error}")
 
-            results = await asyncio.gather(*group_tasks, return_exceptions=True)
-            for group, result in zip(groups_this_round, results):
-                if isinstance(result, Exception):
-                    print(f"❌ خطأ غير معالج في مهمة الكروب {group}: {result}")
+                # Timing is measured start-to-start
+                last_send_start = send_start
 
             db["account_rotation_index"] = (rotation_index + 1) % len(valid_accounts)
             save_data(db)
@@ -2472,7 +2507,7 @@ async def handle_owner_commands(client: Client, message: Message):
                     ) if join_results else "لا توجد كروبات مسجلة."
                     await notify_owner(
                         f"🚀 تم تشغيل البوت!\n"
-                        f"⏱ المؤقت: {timer_value} ثانية\n"
+                        f"⏱ المؤقت: {timer_value} ثانية (تسلسلي بين الحسابات)\n"
                         f"📊 الحسابات: {len(db['accounts'])}\n"
                         f"📢 الكروبات: {len(db['groups'])}\n"
                         f"📝 الكليشات: {len(db['templates'])}\n"
@@ -3040,7 +3075,7 @@ if __name__ == "__main__":
     print(f"📡 Max joined channels per account: {MAX_JOINED_CHANNELS_PER_ACCOUNT}")
     print(f"⏰ Max channel age: {MAX_CHANNEL_AGE_HOURS}h")
     print("✨ Features:")
-    print("  🔄 Sequential posting system")
+    print("  🔄 Sequential posting (strict start-to-start timer spacing)")
     print("  🎯 Template rotation (random)")
     print("  💬 Auto-reply to last user message in group")
     print("  📡 Join channels ONLY from bot/channel messages (user links ignored)")
